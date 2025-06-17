@@ -1,0 +1,1653 @@
+
+library(readr)
+library(derivmkts)
+library(lubridate)
+
+
+option_book <- readRDS("Thesis/SPYoptions_combined_filtered_all_hours.rds")
+
+SPYdata <- read.csv("Thesis/SPYdata_2023_03_06_2025_02_28.csv")
+SPYdata$time <- ymd_hms(SPYdata$time, tz = "UTC")
+
+# ── 0) libraries & parallel plan ─────────────────────────────────────────────
+# library(future.apply)
+library(parallel)
+library(dplyr)
+
+# ── 1) Black–Scholes pricer & implied‐vol ────────────────────────────────────
+bs_call_price <- function(S0, K, r, T, vol) {
+  d1 <- (log(S0/K) + (r + 0.5*vol^2)*T) / (vol*sqrt(T))
+  d2 <- d1 - vol*sqrt(T)
+  S0*pnorm(d1) - K*exp(-r*T)*pnorm(d2)
+}
+
+implied_vol <- function(price, S0, K, r, T,
+                        lower = 1e-6, upper = 15, tol = 1e-8) {
+  f <- function(v) bs_call_price(S0, K, r, T, v) - price
+  uniroot(f, lower = lower, upper = upper, tol = tol)$root
+}
+
+
+
+# Calculate implied volatility
+calculate_implied_volatility <- function(UnderlyingPrice, ExercisePrice, TTM, Target) {
+  # Adjusted bounds for implied volatility
+  High <- 1
+  Low <- 0
+  # Loop until the difference between High and Low is within the tolerance
+  while ((High - Low) > 1e-8) {
+    Mid <- (High + Low) / 2
+    # Evaluate Black-Scholes model for call options with the current midpoint volatility
+    option_price <- derivmkts::bscall(s = UnderlyingPrice, 
+                                      k = ExercisePrice, 
+                                      tt = TTM, 
+                                      r = 0,
+                                      v = Mid,
+                                      d = 0)
+    
+    if (option_price > Target) {
+      High <- Mid
+    } else {
+      Low <- Mid
+    }
+  }
+  # Return the final estimated implied volatility
+  return((High + Low) / 2)
+}
+
+
+# ── 1a) Black–Scholes characteristic function ───────────────────────────────
+phi_bs <- function(u, T, r, 
+                   sigma) {
+  # φ(u) = E[e^{i u ln S_T}] for ln S_T ~ N(ln S0 + (r-½σ²)T, σ²T)
+  i <- 1i
+  mu    <- (r - 0.5 * sigma^2)
+  
+  return(exp(i * u * mu * T - 0.5 * sigma^2 * u^2 * T))
+}
+
+# ── 2) Heston characteristic function (“Little Trap”) ───────────────────────
+phi_heston <- function(u, T, r,
+                       kappa, theta, sigma_v, rho, v0) {
+  i <- 1i
+  a <- kappa * theta
+  
+  d <- sqrt((rho * sigma_v * i * u - kappa)^2 + sigma_v^2*(i*u + u^2))
+  
+  difff <- kappa - rho*sigma_v*i*u
+  
+  g <- (difff - d) / (difff + d) #Styr på sikker her
+  
+  expTerm <- exp(-d * T)
+  
+  base   <- (1 - g*expTerm)/(1 - g)
+  exponent <- -2*a/(sigma_v^2)
+  term1  <- exp(exponent * log(base)) #To rewrite first term
+  
+  return(
+    exp(i * u * r*T ) *
+      exp((theta*kappa / (sigma_v^2)) * ((difff - d) *T - 2*log((1 - g*expTerm)/(1-g))   )) *
+      exp( (v0/ sigma_v^2) * (difff - d) * (1 - expTerm) / (1 - g * expTerm)  )
+    # term1 *                                         # Right below here is -d, as it should, but in project says +d, source https://perswww.kuleuven.be/~u0009713/HestonTrap.pdf
+    #   exp((a*T/ sigma_v^2) * (kappa - rho*sigma_v*i*u - d) + (v0/ sigma_v^2) * (kappa - rho*sigma_v*i*u) * ((1-expTerm) / (1 - g*expTerm)) )
+  ) # without the term exp(i*u*ln(S0))
+}
+
+phi_merton <- function(u, T, r, 
+                       sigma, lambda, alpha, delta) {
+  # φ(u) = E[e^{i u ln S_T}] for ln S_T ~ N(ln S0 + (r-½σ²)T, σ²T)
+  i <- 1i
+  
+  kappa <- exp(alpha + 1/2 * delta^2) - 1
+  
+  mu    <- (r - 0.5 * sigma^2 - lambda*kappa)
+  
+  return(
+    exp(i * u * mu * T - 0.5 * sigma^2 * u^2 * T) * exp(lambda * T * (exp(i*u*alpha - 1/2 *u^2 * delta^2) -1))
+      )
+}
+
+phi_kou <- function(u, T, r, 
+                    sigma, lambda, p, eta1, eta2) {
+  # φ(u) = E[e^{i u ln S_T}] for ln S_T ~ N(ln S0 + (r-½σ²)T, σ²T)
+  i <- 1i
+  
+  kappa <- p * (eta1)/(eta1 - 1) + (1-p) * (eta2)/(eta2 + 1) - 1
+  
+  mu    <- (r - 0.5 * sigma^2 - lambda*kappa)
+  
+  return(
+    exp(i * u * mu * T - 0.5 * sigma^2 * u^2 * T) * exp(lambda * T * (p * (eta1)/(eta1 - i*u) + (1-p) * (eta2)/(eta2 + i*u) - 1))
+  )
+}
+
+phi_bates <- function(u, T, r,
+                       kappa, theta, sigma_v, rho, v0, lambda, alpha, delta) {
+  i <- 1i
+  
+  kappa_jump <- exp(alpha + 1/2 * delta^2) - 1 # As parameter already called kappa
+  
+  mu    <- (r - lambda*kappa_jump)
+  
+  a <- kappa * theta
+  
+  d <- sqrt((rho * sigma_v * i * u - kappa)^2 + sigma_v^2*(i*u + u^2))
+  
+  difff <- kappa - rho*sigma_v*i*u
+  
+  g <- (difff - d) / (difff + d) #Styr på sikker her
+  
+  expTerm <- exp(-d * T)
+  
+  base   <- (1 - g*expTerm)/(1 - g)
+  exponent <- -2*a/(sigma_v^2)
+  term1  <- exp(exponent * log(base)) #To rewrite first term
+  
+  return(
+    exp(i * u * mu*T ) *
+      exp((theta*kappa / (sigma_v^2)) * ((difff - d) *T - 2*log((1 - g*expTerm)/(1-g))   )) *
+      exp( (v0/ sigma_v^2) * (difff - d) * (1 - expTerm) / (1 - g * expTerm)  ) *
+      exp(lambda * T * (exp(i*u*alpha - 1/2 *u^2 * delta^2) -1)) # jump part
+    )
+    
+}
+
+
+phi_VG <- function(u, T, r, sigma, theta, nu) {
+  # φ(u) = E[e^{i u ln S_T}] for ln S_T ~ N(ln S0 + (r-½σ²)T, σ²T)
+  i <- 1i
+  
+  omega <- 1/nu * log(1 - theta*nu - 1/2 *sigma^2)
+
+  return(
+    exp(i*u*(r+omega)*T) *
+    (1 - i*theta*nu*u + 1/2 *sigma^2 *nu*u^2)^(-T/nu)
+  )
+}
+
+
+# ── 3a) Carr–Madan FFT pricer for Black–Scholes ──────────────────────────────
+price_bs_carr_madan <- function(strikes, S0, r, T, params,
+                         N = 2^15, alpha = 1.5, buffer = 0.1) {
+  sigma <- params[["sigma"]]
+  
+  # everything exactly as in price_heston_carr_madan, EXCEPT
+  # replace phi_heston(...) by phi_bs(..., sigma)
+  
+  eta    <- 0.25
+  lambda <- 2*pi/(N*eta);   b <- pi/eta
+  km     <- -b + (0:(N-1)) * lambda
+  Kgrid  <- exp(km)
+  
+  j  <- 0:(N-1)
+  v  <- j * eta
+  u  <- v - (alpha + 1)*1i
+  
+  # damped CF for BS
+  numer <- exp(1i*u*(log(S0) + r*T)) *
+    phi_bs(v - (alpha+1)*1i, T, r, sigma)
+  denom <- alpha^2 + alpha - v^2 + 1i*(2*alpha+1)*v
+  psi_v <- exp(-r*T) * numer/denom
+  
+  w     <- eta/3 * (3 + (-1)^(j+1) - as.numeric(j==0))
+  y     <- exp(1i*b*v) * psi_v * w
+  
+  fft_y <- fft(y)
+  Cgrid <- exp(-alpha*km)/pi * Re(fft_y)
+  
+  return(approx(Kgrid, Cgrid, xout = strikes, rule = 2)$y)
+}
+
+# ── 3) Carr–Madan + FFT pricer for Heston ───────────────────────────────────
+price_heston_carr_madan <- function(strikes, S0, r, T, params,
+                                    N = 2^15, alpha = 1.5, buffer = 0.1) {
+  
+  kappa   <- params[["kappa"]]
+  theta   <- params[["theta"]]
+  sigma_v <- params[["sigma_v"]]
+  rho     <- params[["rho"]]
+  v0      <- params[["v0"]]
+  
+  # j      <- 0:(N-1)
+  
+  eta = 0.25
+  
+  # 2) derive lambda, b
+  lambda <- 2*pi/(N*eta)
+  b      <- pi/eta
+  
+  # 3) build absolute log‐strike grid
+  km    <- -b + (0:(N-1))*lambda
+  Kgrid <- exp(km)         # strikes in dollars
+  
+  j <- 0:(N-1)
+  v <- j * eta
+  u <- v - (alpha+1)*1i
+  
+  # v      <- (j)*eta
+  
+  # damped CF # First part is to get whole characteristic function,
+  numer <- exp(1i * u * log(S0)) * phi_heston(v - (alpha+1)*1i, T, r, kappa,theta,sigma_v,rho,v0) #S0^(1i*(v)) * måske have den her med ellers antages S0=1 og kigges i log returns       #S0^(1i*(v - (alpha+1)*1i)) * phi_heston(v - (alpha+1)*1i, T, r, kappa,theta,sigma_v,rho,v0) # rent NA
+  
+  denom <- alpha^2 + alpha - v^2 + 1i*(2*alpha+1)*v
+  
+  psi_v <- exp(-r*T) * numer/denom
+  
+  # Simpson weights
+  w <- eta/3 * (3 + (-1)^(j+1) - as.numeric(j==0))
+  y <- exp(1i*b*v) * psi_v * w # the fft function itself adds the e^(1i * lambda * eta * (j-1) * (u-1))
+  
+  fft_y <- fft(y)
+  Cgrid <- exp(-alpha*km)/pi * Re(fft_y) # then exclude this factor * S0^(alpha+1)
+  
+  return(approx(Kgrid, Cgrid, xout = strikes, rule = 2)$y)
+}
+
+# ── 3) Carr–Madan + FFT pricer for Merton ───────────────────────────────────
+price_merton_carr_madan <- function(strikes, S0, r, T, params,
+                                    N = 2^15, alpha = 1.5, buffer = 0.1) {
+  
+  sigma         <- params[["sigma"]]
+  lambda_model  <- params[["lambda"]] # as lambda is already in use
+  alpha_model         <- params[["alpha"]]
+  delta         <- params[["delta"]]
+  
+  # j      <- 0:(N-1)
+  
+  eta = 0.25
+  
+  # 2) derive lambda, b
+  lambda <- 2*pi/(N*eta)
+  b      <- pi/eta
+  
+  # 3) build absolute log‐strike grid
+  km    <- -b + (0:(N-1))*lambda
+  Kgrid <- exp(km)         # strikes in dollars
+  
+  j <- 0:(N-1)
+  v <- j * eta
+  u <- v - (alpha+1)*1i
+  
+  # v      <- (j)*eta
+  
+  # damped CF # First part is to get whole characteristic function,
+  numer <- exp(1i * u * log(S0)) * phi_merton(v - (alpha+1)*1i, T, r, sigma, lambda_model, alpha_model, delta) #S0^(1i*(v)) * måske have den her med ellers antages S0=1 og kigges i log returns       #S0^(1i*(v - (alpha+1)*1i)) * phi_heston(v - (alpha+1)*1i, T, r, kappa,theta,sigma_v,rho,v0) # rent NA
+  
+  denom <- alpha^2 + alpha - v^2 + 1i*(2*alpha+1)*v
+  
+  psi_v <- exp(-r*T) * numer/denom
+  
+  # Simpson weights
+  w <- eta/3 * (3 + (-1)^(j+1) - as.numeric(j==0))
+  y <- exp(1i*b*v) * psi_v * w # the fft function itself adds the e^(1i * lambda * eta * (j-1) * (u-1))
+  
+  fft_y <- fft(y)
+  Cgrid <- exp(-alpha*km)/pi * Re(fft_y) # then exclude this factor * S0^(alpha+1)
+  
+  return(approx(Kgrid, Cgrid, xout = strikes, rule = 2)$y)
+}
+
+# ── 3) Carr–Madan + FFT pricer for Kou ───────────────────────────────────
+price_kou_carr_madan <- function(strikes, S0, r, T, params,
+                                    N = 2^15, alpha = 1.5, buffer = 0.1) {
+  
+  sigma         <- params[["sigma"]]
+  lambda_model  <- params[["lambda"]] # as lambda is already in use
+  p             <- params[["p"]]
+  eta1          <- params[["eta1"]]
+  eta2          <- params[["eta2"]]
+  
+  
+  # j      <- 0:(N-1)
+  
+  eta = 0.25
+  
+  # 2) derive lambda, b
+  lambda <- 2*pi/(N*eta)
+  b      <- pi/eta
+  
+  # 3) build absolute log‐strike grid
+  km    <- -b + (0:(N-1))*lambda
+  Kgrid <- exp(km)         # strikes in dollars
+  
+  j <- 0:(N-1)
+  v <- j * eta
+  u <- v - (alpha+1)*1i
+  
+  # v      <- (j)*eta
+  
+  # damped CF # First part is to get whole characteristic function,
+  numer <- exp(1i * u * log(S0)) * phi_kou(v - (alpha+1)*1i, T, r, sigma, lambda_model, p, eta1, eta2) #S0^(1i*(v)) * måske have den her med ellers antages S0=1 og kigges i log returns       #S0^(1i*(v - (alpha+1)*1i)) * phi_heston(v - (alpha+1)*1i, T, r, kappa,theta,sigma_v,rho,v0) # rent NA
+  
+  denom <- alpha^2 + alpha - v^2 + 1i*(2*alpha+1)*v
+  
+  psi_v <- exp(-r*T) * numer/denom
+  
+  # Simpson weights
+  w <- eta/3 * (3 + (-1)^(j+1) - as.numeric(j==0))
+  y <- exp(1i*b*v) * psi_v * w # the fft function itself adds the e^(1i * lambda * eta * (j-1) * (u-1))
+  
+  fft_y <- fft(y)
+  Cgrid <- exp(-alpha*km)/pi * Re(fft_y) # then exclude this factor * S0^(alpha+1)
+  
+  return(approx(Kgrid, Cgrid, xout = strikes, rule = 2)$y)
+}
+
+# ── 3) Carr–Madan + FFT pricer for Bates ───────────────────────────────────
+price_bates_carr_madan <- function(strikes, S0, r, T, params,
+                                 N = 2^15, alpha = 1.5, buffer = 0.1) {
+
+  kappa   <- params[["kappa"]]
+  theta   <- params[["theta"]]
+  sigma_v <- params[["sigma_v"]]
+  rho     <- params[["rho"]]
+  v0      <- params[["v0"]]  
+  lambda_model  <- params[["lambda"]] # as lambda is already in use
+  alpha_model         <- params[["alpha"]]
+  delta         <- params[["delta"]]
+  
+  
+  # j      <- 0:(N-1)
+  
+  eta = 0.25
+  
+  # 2) derive lambda, b
+  lambda <- 2*pi/(N*eta)
+  b      <- pi/eta
+  
+  # 3) build absolute log‐strike grid
+  km    <- -b + (0:(N-1))*lambda
+  Kgrid <- exp(km)         # strikes in dollars
+  
+  j <- 0:(N-1)
+  v <- j * eta
+  u <- v - (alpha+1)*1i
+  
+  # v      <- (j)*eta
+  
+  # damped CF # First part is to get whole characteristic function,
+  numer <- exp(1i * u * log(S0)) * phi_bates(v - (alpha+1)*1i, T, r, kappa,theta,sigma_v,rho,v0,lambda_model, alpha_model, delta) #S0^(1i*(v)) * måske have den her med ellers antages S0=1 og kigges i log returns       #S0^(1i*(v - (alpha+1)*1i)) * phi_heston(v - (alpha+1)*1i, T, r, kappa,theta,sigma_v,rho,v0) # rent NA
+  
+  denom <- alpha^2 + alpha - v^2 + 1i*(2*alpha+1)*v
+  
+  psi_v <- exp(-r*T) * numer/denom
+  
+  # Simpson weights
+  w <- eta/3 * (3 + (-1)^(j+1) - as.numeric(j==0))
+  y <- exp(1i*b*v) * psi_v * w # the fft function itself adds the e^(1i * lambda * eta * (j-1) * (u-1))
+  
+  fft_y <- fft(y)
+  Cgrid <- exp(-alpha*km)/pi * Re(fft_y) # then exclude this factor * S0^(alpha+1)
+  
+  return(approx(Kgrid, Cgrid, xout = strikes, rule = 2)$y)
+}
+
+
+# ── 3) Carr–Madan + FFT pricer for VG ───────────────────────────────────
+price_VG_carr_madan <- function(strikes, S0, r, T, params,
+                                    N = 2^15, alpha = 1.5, buffer = 0.1) {
+  
+  sigma <- params[["sigma"]]
+  theta <- params[["theta"]]
+  nu    <- params[["nu"]]
+  
+  # j      <- 0:(N-1)
+  
+  eta = 0.25
+  
+  # 2) derive lambda, b
+  lambda <- 2*pi/(N*eta)
+  b      <- pi/eta
+  
+  # 3) build absolute log‐strike grid
+  km    <- -b + (0:(N-1))*lambda
+  Kgrid <- exp(km)         # strikes in dollars
+  
+  j <- 0:(N-1)
+  v <- j * eta
+  u <- v - (alpha+1)*1i
+  
+  # v      <- (j)*eta
+  
+  # damped CF # First part is to get whole characteristic function,
+  numer <- exp(1i * u * log(S0)) * phi_VG(v - (alpha+1)*1i, T, r, sigma, theta, nu) #S0^(1i*(v)) * måske have den her med ellers antages S0=1 og kigges i log returns       #S0^(1i*(v - (alpha+1)*1i)) * phi_heston(v - (alpha+1)*1i, T, r, kappa,theta,sigma_v,rho,v0) # rent NA
+  
+  denom <- alpha^2 + alpha - v^2 + 1i*(2*alpha+1)*v
+  
+  psi_v <- exp(-r*T) * numer/denom
+  
+  # Simpson weights
+  w <- eta/3 * (3 + (-1)^(j+1) - as.numeric(j==0))
+  y <- exp(1i*b*v) * psi_v * w # the fft function itself adds the e^(1i * lambda * eta * (j-1) * (u-1))
+  
+  fft_y <- fft(y)
+  Cgrid <- exp(-alpha*km)/pi * Re(fft_y) # then exclude this factor * S0^(alpha+1)
+  
+  return(approx(Kgrid, Cgrid, xout = strikes, rule = 2)$y)
+}
+
+
+price_bs_cos <- function(strikes, S0, r, T,
+                             params,
+                             N = 128, # number of COS terms
+                             L = 12) {# truncation width multiplier
+  
+  
+  sigma         <- params[["sigma"]]
+  
+  
+  M   <- length(strikes)
+  
+  # 1) log‐moneyness x_j = ln(S0 / K_j), length M
+  xj  <- log(S0 / strikes)
+  
+  kappa <- exp(alpha + 1/2 * delta^2) - 1
+  
+  # 2) choose truncation [a,b] using first two cumulants c1,c2
+  c1  <- (r- 1/2*sigma^2) *T
+  c2  <- sigma^2 *T
+  
+  a   <- c1 - L*sqrt(abs(c2))
+  b   <- c1 + L*sqrt(abs(c2))
+  
+  # 3) COS frequencies u_k = k*pi/(b-a), k=0..N-1
+  k   <- 0:(N-1)
+  u   <- k * pi / (b - a)
+  
+  # 4) compute ρ_heston(u_k) for all k
+  rho_vals <- phi_bs(u, T, r, sigma)
+  
+  # 5) payoff‐integrals U_k via χ,ψ on [0,b]
+  compute_Uk <- function(uk) {
+    if (uk == 0) {
+      chi <- exp(b) - 1
+      psi <- b
+    } else {
+      alpha <- -uk * a
+      beta  <-  uk * (b - a)
+      chi   <- (exp(b)*cos(beta) - cos(alpha) +
+                  uk*(exp(b)*sin(beta) - sin(alpha))) / (1 + uk^2)
+      psi   <- (sin(beta) - sin(alpha)) / uk
+    }
+    (2/(b - a)) * (chi - psi)
+  }
+  Uk       <- sapply(u, compute_Uk)   # vector length N
+  
+  # 6) weights = ρ(u_k) * U_k, length N
+  weights  <- rho_vals * Uk
+  
+  # 7) phase matrix: cos(u_k * (x_j - a)), size N×M
+  #    phase[k,j] = cos( u[k] * ( xj[j] - a ) )
+  phase    <- outer(u, xj - a, function(uk, x) cos(uk * x))
+  
+  # 8) normalized COS sums v3[j] = sum_k weights[k] * phase[k,j], length M
+  v3       <- Re(colSums(weights * phase))
+  
+  # 9) final call prices C0[j] = exp(-rT) * K[j] * v3[j], length M
+  C0       <- exp(-r * T) * strikes * v3
+  
+  return(C0)
+}
+
+price_heston_cos <- function(strikes, S0, r, T,
+                                    params,
+                                    N = 128, # number of COS terms
+                                    L = 12) {# truncation width multiplier
+  
+  kappa   <- params[["kappa"]]
+  theta   <- params[["theta"]]
+  sigma_v <- params[["sigma_v"]]
+  rho     <- params[["rho"]]
+  v0      <- params[["v0"]]
+  
+  M   <- length(strikes)
+  
+  # 1) log‐moneyness x_j = ln(S0 / K_j), length M
+  xj  <- log(S0 / strikes)
+  
+  # 2) choose truncation [a,b] using first two cumulants c1,c2
+  c1  <- (r - 0.5*theta)*T + (theta - v0)*(1 - exp(-kappa*T))/(2*kappa)
+  c2  <- (1/(8*kappa^3)) * (
+    sigma_v^2*(1-exp(-kappa*T))^2*(v0-theta) +
+      2*theta*kappa*T - 3*theta +
+      4*theta*exp(-kappa*T) - theta*exp(-2*kappa*T)
+  )
+  
+  a   <- c1 - L*sqrt(abs(c2))
+  b   <- c1 + L*sqrt(abs(c2))
+  
+  # 3) COS frequencies u_k = k*pi/(b-a), k=0..N-1
+  k   <- 0:(N-1)
+  u   <- k * pi / (b - a)
+  
+  # 4) compute ρ_heston(u_k) for all k
+  rho_vals <- phi_heston(u, T, r, kappa, theta, sigma_v, rho, v0)
+  
+  # 5) payoff‐integrals U_k via χ,ψ on [0,b]
+  compute_Uk <- function(uk) {
+    if (uk == 0) {
+      chi <- exp(b) - 1
+      psi <- b
+    } else {
+      alpha <- -uk * a
+      beta  <-  uk * (b - a)
+      chi   <- (exp(b)*cos(beta) - cos(alpha) +
+                  uk*(exp(b)*sin(beta) - sin(alpha))) / (1 + uk^2)
+      psi   <- (sin(beta) - sin(alpha)) / uk
+    }
+    (2/(b - a)) * (chi - psi)
+  }
+  Uk       <- sapply(u, compute_Uk)   # vector length N
+  
+  # 6) weights = ρ(u_k) * U_k, length N
+  weights  <- rho_vals * Uk
+  
+  # 7) phase matrix: cos(u_k * (x_j - a)), size N×M
+  #    phase[k,j] = cos( u[k] * ( xj[j] - a ) )
+  phase    <- outer(u, xj - a, function(uk, x) cos(uk * x))
+  
+  # 8) normalized COS sums v3[j] = sum_k weights[k] * phase[k,j], length M
+  v3       <- Re(colSums(weights * phase))
+  
+  # 9) final call prices C0[j] = exp(-rT) * K[j] * v3[j], length M
+  C0       <- exp(-r * T) * strikes * v3
+  
+  return(C0)
+}
+
+price_merton_cos <- function(strikes, S0, r, T,
+                             params,
+                             N = 128, # number of COS terms
+                             L = 12) {# truncation width multiplier
+  
+  
+  sigma         <- params[["sigma"]]
+  lambda_model  <- params[["lambda"]] # as lambda is already in use
+  alpha_model   <- params[["alpha"]]
+  delta         <- params[["delta"]]
+  
+  
+  M   <- length(strikes)
+  
+  # 1) log‐moneyness x_j = ln(S0 / K_j), length M
+  xj  <- log(S0 / strikes)
+  
+  kappa <- exp(alpha + 1/2 * delta^2) - 1
+  
+  # 2) choose truncation [a,b] using first two cumulants c1,c2
+  c1  <- (r - 1/2*sigma^2 - lambda_model*kappa)*T + lambda_model*alpha_model*T
+  c2  <- sigma^2 *T + lambda_model*(alpha_model^2 + delta^2)*T
+  
+  a   <- c1 - L*sqrt(abs(c2))
+  b   <- c1 + L*sqrt(abs(c2))
+  
+  # 3) COS frequencies u_k = k*pi/(b-a), k=0..N-1
+  k   <- 0:(N-1)
+  u   <- k * pi / (b - a)
+  
+  # 4) compute ρ_heston(u_k) for all k
+  rho_vals <- phi_merton(u, T, r, sigma, lambda_model, alpha_model, delta)
+  
+  # 5) payoff‐integrals U_k via χ,ψ on [0,b]
+  compute_Uk <- function(uk) {
+    if (uk == 0) {
+      chi <- exp(b) - 1
+      psi <- b
+    } else {
+      alpha <- -uk * a
+      beta  <-  uk * (b - a)
+      chi   <- (exp(b)*cos(beta) - cos(alpha) +
+                  uk*(exp(b)*sin(beta) - sin(alpha))) / (1 + uk^2)
+      psi   <- (sin(beta) - sin(alpha)) / uk
+    }
+    (2/(b - a)) * (chi - psi)
+  }
+  Uk       <- sapply(u, compute_Uk)   # vector length N
+  
+  # 6) weights = ρ(u_k) * U_k, length N
+  weights  <- rho_vals * Uk
+  
+  # 7) phase matrix: cos(u_k * (x_j - a)), size N×M
+  #    phase[k,j] = cos( u[k] * ( xj[j] - a ) )
+  phase    <- outer(u, xj - a, function(uk, x) cos(uk * x))
+  
+  # 8) normalized COS sums v3[j] = sum_k weights[k] * phase[k,j], length M
+  v3       <- Re(colSums(weights * phase))
+  
+  # 9) final call prices C0[j] = exp(-rT) * K[j] * v3[j], length M
+  C0       <- exp(-r * T) * strikes * v3
+  
+  return(C0)
+}
+
+price_kou_cos <- function(strikes, S0, r, T,
+                             params,
+                             N = 128, # number of COS terms
+                             L = 12) {# truncation width multiplier
+  
+  
+  sigma         <- params[["sigma"]]
+  lambda_model  <- params[["lambda"]] # as lambda is already in use
+  p             <- params[["p"]]
+  eta1          <- params[["eta1"]]
+  eta2          <- params[["eta2"]]
+  
+  
+  M   <- length(strikes)
+  
+  # 1) log‐moneyness x_j = ln(S0 / K_j), length M
+  xj  <- log(S0 / strikes)
+  
+  kappa <- p * (eta1)/(eta1 - 1) + (1-p) * (eta2)/(eta2 + 1) - 1
+  
+  M2 <- 2*p /(eta1 - 1)^2 + 2*(1-p) /(eta2 + 1)^2
+  
+  # 2) choose truncation [a,b] using first two cumulants c1,c2
+  c1  <- (r - 1/2*sigma^2 - lambda_model*kappa)*T + lambda_model*(p/(eta1 - 1) + (1-p)/(eta2 + 1))*T
+  c2  <- sigma^2 *T + lambda_model*(M2)*T
+  
+  a   <- c1 - L*sqrt(abs(c2))
+  b   <- c1 + L*sqrt(abs(c2))
+  
+  # 3) COS frequencies u_k = k*pi/(b-a), k=0..N-1
+  k   <- 0:(N-1)
+  u   <- k * pi / (b - a)
+  
+  # 4) compute ρ_heston(u_k) for all k
+  rho_vals <- phi_kou(u, T, r, sigma, lambda_model, p, eta1, eta2)
+  
+  # 5) payoff‐integrals U_k via χ,ψ on [0,b]
+  compute_Uk <- function(uk) {
+    if (uk == 0) {
+      chi <- exp(b) - 1
+      psi <- b
+    } else {
+      alpha <- -uk * a
+      beta  <-  uk * (b - a)
+      chi   <- (exp(b)*cos(beta) - cos(alpha) +
+                  uk*(exp(b)*sin(beta) - sin(alpha))) / (1 + uk^2)
+      psi   <- (sin(beta) - sin(alpha)) / uk
+    }
+    (2/(b - a)) * (chi - psi)
+  }
+  Uk       <- sapply(u, compute_Uk)   # vector length N
+  
+  # 6) weights = ρ(u_k) * U_k, length N
+  weights  <- rho_vals * Uk
+  
+  # 7) phase matrix: cos(u_k * (x_j - a)), size N×M
+  #    phase[k,j] = cos( u[k] * ( xj[j] - a ) )
+  phase    <- outer(u, xj - a, function(uk, x) cos(uk * x))
+  
+  # 8) normalized COS sums v3[j] = sum_k weights[k] * phase[k,j], length M
+  v3       <- Re(colSums(weights * phase))
+  
+  # 9) final call prices C0[j] = exp(-rT) * K[j] * v3[j], length M
+  C0       <- exp(-r * T) * strikes * v3
+  
+  return(C0)
+}
+
+price_bates_cos <- function(strikes, S0, r, T,
+                          params,
+                          N = 128, # number of COS terms
+                          L = 12) {# truncation width multiplier
+  
+  
+  kappa   <- params[["kappa"]]
+  theta   <- params[["theta"]]
+  sigma_v <- params[["sigma_v"]]
+  rho     <- params[["rho"]]
+  v0      <- params[["v0"]]  
+  lambda_model  <- params[["lambda"]] # as lambda is already in use
+  alpha_model         <- params[["alpha"]]
+  delta         <- params[["delta"]]
+  
+  
+  M   <- length(strikes)
+  
+  # 1) log‐moneyness x_j = ln(S0 / K_j), length M
+  xj  <- log(S0 / strikes)
+  
+  
+  # 2) choose truncation [a,b] using first two cumulants c1,c2
+  c1  <- (r - 0.5*theta)*T + (theta - v0)*(1 - exp(-kappa*T))/(2*kappa) + lambda_model*alpha_model*T
+  c2  <- (1/(8*kappa^3)) * (
+    sigma_v^2*(1-exp(-kappa*T))^2*(v0-theta) +
+      2*theta*kappa*T - 3*theta +
+      4*theta*exp(-kappa*T) - theta*exp(-2*kappa*T)
+  ) + lambda_model*(alpha_model^2 + delta^2)*T
+  
+  a   <- c1 - L*sqrt(abs(c2))
+  b   <- c1 + L*sqrt(abs(c2))
+  
+  # 3) COS frequencies u_k = k*pi/(b-a), k=0..N-1
+  k   <- 0:(N-1)
+  u   <- k * pi / (b - a)
+  
+  # 4) compute ρ_heston(u_k) for all k
+  rho_vals <- phi_bates(u, T, r, kappa, theta, sigma_v, rho, v0, lambda_model, alpha_model, delta)
+  
+  # 5) payoff‐integrals U_k via χ,ψ on [0,b]
+  compute_Uk <- function(uk) {
+    if (uk == 0) {
+      chi <- exp(b) - 1
+      psi <- b
+    } else {
+      alpha <- -uk * a
+      beta  <-  uk * (b - a)
+      chi   <- (exp(b)*cos(beta) - cos(alpha) +
+                  uk*(exp(b)*sin(beta) - sin(alpha))) / (1 + uk^2)
+      psi   <- (sin(beta) - sin(alpha)) / uk
+    }
+    (2/(b - a)) * (chi - psi)
+  }
+  Uk       <- sapply(u, compute_Uk)   # vector length N
+  
+  # 6) weights = ρ(u_k) * U_k, length N
+  weights  <- rho_vals * Uk
+  
+  # 7) phase matrix: cos(u_k * (x_j - a)), size N×M
+  #    phase[k,j] = cos( u[k] * ( xj[j] - a ) )
+  phase    <- outer(u, xj - a, function(uk, x) cos(uk * x))
+  
+  # 8) normalized COS sums v3[j] = sum_k weights[k] * phase[k,j], length M
+  v3       <- Re(colSums(weights * phase))
+  
+  # 9) final call prices C0[j] = exp(-rT) * K[j] * v3[j], length M
+  C0       <- exp(-r * T) * strikes * v3
+  
+  return(C0)
+}
+
+
+price_VG_cos <- function(strikes, S0, r, T,
+                          params,
+                          N = 128, # number of COS terms
+                          L = 12) {# truncation width multiplier
+  
+  
+  sigma <- params[["sigma"]]
+  theta <- params[["theta"]]
+  nu    <- params[["nu"]]
+  
+  
+  M   <- length(strikes)
+  
+  # 1) log‐moneyness x_j = ln(S0 / K_j), length M
+  xj  <- log(S0 / strikes)
+
+
+  # 2) choose truncation [a,b] using first two cumulants c1,c2
+  c1  <- theta*T
+  c2  <- (sigma^2 + theta^2*nu) *T
+  
+  # c_4 only for VG
+  c4 <- 3*nu*(sigma^2 + theta^2 *nu)^2 *T
+  
+  b   <- c1 + L*sqrt(abs(c2) + sqrt(abs(c4)))
+  a   <- c1 - L*sqrt(abs(c2) + sqrt(abs(c4)))
+  
+  # 3) COS frequencies u_k = k*pi/(b-a), k=0..N-1
+  k   <- 0:(N-1)
+  u   <- k * pi / (b - a)
+  
+  # 4) compute ρ_heston(u_k) for all k
+  rho_vals <- phi_VG(u, T, r, sigma, theta, nu)
+  
+  # 5) payoff‐integrals U_k via χ,ψ on [0,b]
+  compute_Uk <- function(uk) {
+    if (uk == 0) {
+      chi <- exp(b) - 1
+      psi <- b
+    } else {
+      alpha <- -uk * a
+      beta  <-  uk * (b - a)
+      chi   <- (exp(b)*cos(beta) - cos(alpha) +
+                  uk*(exp(b)*sin(beta) - sin(alpha))) / (1 + uk^2)
+      psi   <- (sin(beta) - sin(alpha)) / uk
+    }
+    (2/(b - a)) * (chi - psi)
+  }
+  Uk       <- sapply(u, compute_Uk)   # vector length N
+  
+  # 6) weights = ρ(u_k) * U_k, length N
+  weights  <- rho_vals * Uk
+  
+  # 7) phase matrix: cos(u_k * (x_j - a)), size N×M
+  #    phase[k,j] = cos( u[k] * ( xj[j] - a ) )
+  phase    <- outer(u, xj - a, function(uk, x) cos(uk * x))
+  
+  # 8) normalized COS sums v3[j] = sum_k weights[k] * phase[k,j], length M
+  v3       <- Re(colSums(weights * phase))
+  
+  # 9) final call prices C0[j] = exp(-rT) * K[j] * v3[j], length M
+  C0       <- exp(-r * T) * strikes * v3
+  
+  return(C0)
+}
+
+
+
+
+
+
+
+# ── 2) build the single `models` list ────────────────────────────────────
+models <- list(
+  
+  BS = list(
+    init    = c(sigma=0.2),
+    pack    = function(p) log(p["sigma"]),
+    unpack  = function(x) setNames(exp(x),"sigma"),
+    pricers = list(
+      fft = price_bs_carr_madan,
+      cos = price_bs_cos
+    )
+  ),
+  
+  Heston = list(
+    init    = c(kappa=1,theta=0.04,sigma_v=0.3,rho=-0.6,v0=0.04),
+    pack    = function(p) c(log(p["kappa"]),log(p["theta"]),
+                            log(p["sigma_v"]),atanh(p["rho"]),
+                            log(p["v0"])),
+    unpack  = function(x) setNames(
+      c(exp(x[1]),exp(x[2]),exp(x[3]),tanh(x[4]),exp(x[5])),
+      c("kappa","theta","sigma_v","rho","v0")
+    ),
+    pricers = list(
+      fft = price_heston_carr_madan,
+      cos = price_heston_cos
+    )
+  ),
+  Merton = list(
+    init    = c(sigma=0.2, lambda=0.1, alpha=0,  delta=0.2),
+    pack   = function(p) c(
+      log(p["sigma"]),
+      log(p["lambda"]),
+      p["alpha"],
+      log(p["delta"])
+    ),
+    unpack = function(x) setNames(c(
+      exp(x[1]),
+      exp(x[2]),
+      x[3],
+      exp(x[4])
+    ), c("sigma","lambda","alpha","delta")),
+    pricers = list(
+      fft = price_merton_carr_madan,
+      cos = price_merton_cos
+    )
+  ),
+  Kou = list(
+    init    = c(sigma=0.2, lambda=0.1, p=0.5, eta1=10, eta2=10),
+    pack   = function(p) c(
+      log(p["sigma"]),
+      log(p["lambda"]),
+      qlogis(p["p"]),
+      log(p["eta1"] - 1),
+      log(p["eta2"])
+    ),
+    unpack = function(x) setNames(c(
+      exp(x[1]),
+      exp(x[2]),
+      plogis(x[3]),
+      1 + exp(x[4]),
+      exp(x[5])
+    ), c("sigma","lambda","p","eta1","eta2")),
+    pricers = list(
+      fft = price_kou_carr_madan,
+      cos = price_kou_cos
+    )
+  ),
+  Bates = list(
+    init    = c(kappa=1, theta=0.04, sigma_v=0.3, rho=-0.6, v0=0.04,
+                lambda=0.1, alpha=0,  delta=0.2),
+    pack   = function(p) c(
+      # Heston block
+      log(p["kappa"]),
+      log(p["theta"]),
+      log(p["sigma_v"]),
+      atanh(p["rho"]),
+      log(p["v0"]),
+      # Merton‐jump block
+      log(p["lambda"]),
+      p["alpha"],
+      log(p["delta"])
+    ),
+    unpack = function(x) setNames(c(
+        exp(x[1]),
+        exp(x[2]),
+        exp(x[3]),
+        tanh(x[4]),
+        exp(x[5]),
+        exp(x[6]),
+        x[7],
+        exp(x[8])
+      ), c("kappa","theta","sigma_v","rho","v0",
+           "lambda","alpha","delta")),
+    pricers = list(
+      fft = price_bates_carr_madan,
+      cos = price_bates_cos
+    )
+  ),
+  VG = list(
+    init    = c(sigma=0.2, theta=0.0, nu=0.5),
+    pack   = function(p) c(
+      log(p["sigma"]),
+      p["theta"],
+      log(p["nu"])
+    ),
+    unpack = function(x) setNames(c(
+      exp(x[1]),
+      x[2],
+      exp(x[3])
+    ), c("sigma","theta","nu")),
+    pricers = list(
+      fft = price_VG_carr_madan,
+      cos = price_VG_cos
+    )
+  )
+)
+
+# ── 3) generic calibrator ─────────────────────────────────────────────────
+calibrate_model <- function(strikes, market, S0, r, T,
+                            model, pricer_name, fit_to=c("iv","price")) {
+  fit_to <- match.arg(fit_to)
+  M      <- models[[model]]
+  if (is.null(M)) stop("unknown model ",model)
+  pack      <- M$pack
+  unpack    <- M$unpack
+  pricer    <- M$pricers[[pricer_name]]
+  if (is.null(pricer)) stop("no pricer ‘",pricer_name,"’ for ",model)
+  
+  obj <- function(x) {
+    p    <- unpack(x)
+    Cmod <- pricer(strikes, S0, r, T, p)
+    intrinsic <- pmax(S0 - strikes*exp(-r*T), 0)
+    Cmod      <- pmax(Cmod, intrinsic + 1e-8)
+    if (fit_to=="price") {
+      mean((Cmod - market)^2)
+    } else {
+      ivm <- mapply(implied_vol,
+                    price=Cmod, K=strikes,
+                    MoreArgs=list(S0=S0,r=r,T=T))
+      mean((ivm - market)^2)
+    }
+  }
+  
+  x0  <- pack(M$init)
+  fit <- optim(x0, obj, method="BFGS",
+               control=list(maxit=500))
+  best <- unpack(fit$par)
+  list(params=best, mse=fit$value, conv=fit$conv,
+       n_fun=fit$counts["function"],
+       n_grad=fit$counts["gradient"])
+}
+
+
+# 5a) build job list
+jobs_list <- list()
+for(day in names(option_book)) {
+  inner <- option_book[[day]]
+  # skip days with no strikes
+  if (length(inner) < 1) next
+  
+  # pick up the time‐stamps from the first strike's data.frame
+  # times <- unique(inner[[1]]$time)
+  all_times <- sort(unique(unlist(lapply(inner, `[[`, "time"))))
+  for(dt in all_times) {
+    jobs_list[[ length(jobs_list) + 1 ]] <- list(
+      day      = day,
+      datetime = as.POSIXct(dt, tz="UTC")
+    )
+  }
+}
+
+# ── 5) the worker uses calibrate_model() plus any pricer you choose ──────
+worker <- function(job, model_name, pricer_name, fit_to="price") {
+  day <- job$day; dt <- job$datetime
+  # spot
+  spot_row <- SPYdata %>% filter(time==dt)
+  if(nrow(spot_row)==0) return(NULL)
+  S0 <- spot_row$o[1]
+  # options slice
+  dat <- bind_rows(lapply(names(option_book[[day]]), function(Ks) {
+    df <- option_book[[day]][[Ks]] %>% filter(time==dt)
+    if(nrow(df)==0) return(NULL)
+    data.frame(strike=as.numeric(Ks),
+               price = df$open,
+               iv_mkt= df$IV,
+               ttm   = df$ttm[1]/252)
+  }))
+  
+  # Filter out options with prices below the intrinsic value
+  r0=0
+  dat <- dat %>%
+    mutate(intrinsic = pmax(S0 - strike * exp(-r0 * ttm), 0)) %>%
+    filter(price > intrinsic + 1e-8)
+  
+  if(nrow(dat)<5) return(NULL)
+  
+  # … slice SPYdata & option_book into `dat` with strike, price, iv_mkt, ttm …
+  strikes <- dat$strike
+  Ttm     <- dat$ttm[1]
+  # choose market‐target: IV for all non‐BS models, prices for BS
+  if (fit_to=="price") {
+    market <- dat$price
+  } else if (fit_to=="iv") {
+    market <- dat$iv_mkt
+  }
+  
+  tryCatch({
+    t0  <- Sys.time()
+    fit <- calibrate_model(
+      strikes     = strikes,
+      market      = market,
+      S0          = S0,
+      r           = 0,
+      T           = Ttm,
+      model       = model_name,
+      pricer_name = pricer_name,
+      fit_to      = fit_to
+    )
+    dt_ <- as.numeric(difftime(Sys.time(),t0,units="secs"))
+    
+    # recompute model prices & IV‐error metrics
+    Cmod <- models[[model_name]]$pricers[[pricer_name]](
+      strikes, S0, 0, Ttm, fit$params
+    )
+    intrinsic <- pmax(S0 - strikes*exp(-0*Ttm),0)
+    Cmod      <- pmax(Cmod, intrinsic+1e-8)
+    iv_mod <- mapply(implied_vol, price=Cmod, K=strikes,
+                     MoreArgs=list(S0=S0,r=0,T=Ttm))
+    
+    return(c(
+      list(
+      model        = model_name,
+      pricer       = pricer_name,
+      fit_to       = fit_to,
+      datetime     = job$datetime,
+      n_options    = length(strikes),
+      calib_time   = dt_,
+      n_func       = fit$n_fun,
+      n_grad       = fit$n_grad,
+      mse_iv       = mean((iv_mod - dat$iv_mkt)^2),
+      mse_pr       = mean((Cmod - dat$price)^2),
+      mae_iv       = mean(abs(iv_mod - dat$iv_mkt)),
+      mae_pr       = mean(abs(Cmod - dat$price)),
+      conv         = fit$conv
+    ),
+    as.list(fit$params)
+    )
+    )
+  }, error = function(e) {
+    message("✖ ", model_name, "/", pricer_name," @ ", job$datetime,
+            ": ", e$message)
+    NULL
+  })
+}
+
+
+Sys.time() |>print()
+all_results <- list()
+for(m in names(models)) { print(m);
+ for(pf in names(models[[m]]$pricers)) { print(pf);
+   key <- paste(m,pf,sep="_")
+   all_results[[key]] <- mclapply(
+     jobs_list[1:49], 
+     function(job) worker(job, model_name=m, pricer_name=pf, fit_to="price"),
+     mc.cores = 50,
+     mc.preschedule = FALSE)
+ }
+}
+Sys.time() |>print()
+
+Sys.time() |>print()
+all_results2 <- list()
+for(m in names(models)) { print(m);
+  for(pf in names(models[[m]]$pricers)) { print(pf);
+    key <- paste(m,pf,sep="_")
+    all_results2[[key]] <- mclapply(
+      jobs_list[1:49], 
+      function(job) worker(job, model_name=m, pricer_name=pf, fit_to="iv"),
+      mc.cores = 50,
+      mc.preschedule = FALSE)
+  }
+}
+Sys.time() |>print()
+
+
+# ── 7) collate & summarize all results ────────────────────────────────────
+
+# turn each list‐of‐lists into one big tibble
+all_df <- lapply(all_results, bind_rows) %>% 
+  bind_rows(.id = "model_pricer")
+
+all_df[order(all_df$calib_time, decreasing = TRUE),] |>head(10)
+all_df[all_df$conv==0,][order(all_df[all_df$conv==0,]$calib_time, decreasing = TRUE),] |>head(10)
+
+all_df[all_df$conv==0,] |>nrow()
+all_df |>nrow()
+
+
+all_df[all_df$pricer=='fft',][order(all_df[all_df$pricer=='fft',]$calib_time, decreasing = TRUE),] |>head(10)
+all_df[all_df$pricer=='cos',][order(all_df[all_df$pricer=='cos',]$calib_time, decreasing = TRUE),] |>head(10)
+
+
+#Disse er med N=128 og N=2^15, L=12 og alpha = 1.5, er ved at køre nye med N=2^10 for at se om resultater bliver dårlgiere da meget hurtigere kalibrering
+
+df_temp1 <- readRDS(file = 'Thesis/calib_results_cos_price3.rds')
+
+df_temp2 <- readRDS(file = 'Thesis/calib_results_cos_iv2.rds')
+
+df_temp3 <- readRDS(file = 'Thesis/calib_results_fft_price.rds')
+
+df_temp4 <- readRDS(file = 'Thesis/calib_results_fft_iv.rds')
+
+
+all_df_temp <- bind_rows(df_temp1, df_temp2, df_temp3, df_temp4)
+
+
+all_df_temp %>% filter(conv==0) %>%
+  group_by(model, pricer, fit_to) %>%
+  summarize(
+    n_calibs    = n(),
+    avg_mae_iv  = mean(mae_iv, na.rm=TRUE),
+    avg_mae_pr  = mean(mae_pr, na.rm=TRUE),
+    avg_time    = mean(calib_time, na.rm=TRUE),
+    pct_conv1   = mean(conv==0, na.rm=TRUE),
+    .groups="drop"
+  )
+
+
+all_df_temp %>% filter(conv==0) %>%
+  group_by(model, pricer, fit_to) %>%
+  summarize(
+    n_calibs    = n(),
+    avg_mae_iv  = mean(mae_iv, na.rm=TRUE),
+    avg_mae_pr  = mean(mae_pr, na.rm=TRUE),
+    avg_mse_iv  = mean(mse_iv, na.rm=TRUE),
+    avg_mse_pr  = mean(mse_pr, na.rm=TRUE),
+    avg_time    = mean(calib_time, na.rm=TRUE),
+    pct_conv1   = mean(conv==0, na.rm=TRUE),
+    .groups="drop"
+  ) %>% filter(fit_to=='price') |>print(n=20)
+
+
+# overall performance by model + pricer
+summary_overall <- all_df %>%
+  group_by(model, pricer) %>%
+  summarize(
+    n_calibs    = n(),
+    avg_mae_iv  = mean(mae_iv, na.rm=TRUE),
+    avg_mae_pr  = mean(mae_pr, na.rm=TRUE),
+    avg_time    = mean(calib_time, na.rm=TRUE),
+    pct_conv1   = mean(conv==0, na.rm=TRUE),
+    .groups="drop"
+  )
+
+# extract clock‐of‐day
+all_df <- all_df %>%
+  mutate(clock = format(datetime, "%H:%M"))
+
+# per‐clock performance (e.g. 09:30,10:30,…)
+summary_by_clock <- all_df %>%
+  group_by(model, pricer, clock) %>%
+  summarize(
+    n_calibs    = n(),
+    avg_mae_iv  = mean(mae_iv, na.rm=TRUE),
+    avg_mae_pr  = mean(mae_pr, na.rm=TRUE),
+    .groups="drop"
+  )
+
+# now you can inspect:
+print(summary_overall)
+print(summary_by_clock)
+
+
+all_df_temp %>% filter(conv==0) %>% mutate(clock = format(datetime, "%H:%M")) %>%
+  group_by(model, pricer, fit_to, clock) %>%
+  summarize(
+    n_calibs    = n(),
+    avg_mae_iv  = mean(mae_iv, na.rm=TRUE),
+    avg_mae_pr  = mean(mae_pr, na.rm=TRUE),
+    avg_mse_iv  = mean(mse_iv, na.rm=TRUE),
+    avg_mse_pr  = mean(mse_pr, na.rm=TRUE),
+    avg_time    = mean(calib_time, na.rm=TRUE),
+    pct_conv1   = mean(conv==0, na.rm=TRUE),
+    .groups="drop"
+  ) %>% filter(model=='Kou') %>% filter(fit_to=='iv') %>% filter(pricer=='fft')|>print(n=25)
+
+
+
+
+all_df_temp %>% filter(conv==0) %>% mutate(clock = format(datetime, "%H:%M")) %>%
+  group_by(model, pricer, fit_to, clock) %>%
+  summarize(
+    n_calibs    = n(),
+    avg_mae_iv  = mean(mae_iv, na.rm=TRUE),
+    avg_mae_pr  = mean(mae_pr, na.rm=TRUE),
+    avg_time    = mean(calib_time, na.rm=TRUE),
+    pct_conv1   = mean(conv==0, na.rm=TRUE),
+    .groups="drop"
+  )|>print(n=25)
+
+
+
+#----------------------Test smiles with values ---------------------------
+
+library(ggplot2)
+library(dplyr)
+
+# 1) Black–Scholes
+base_bs <- list(sigma=0.2)
+make_bs_smiles <- function(param, values,
+                           S0=500, strikes=seq(475, 525, by = 1),
+                           Tmat=1/252, r0=0,
+                           iv_tol_lower=1e-6, iv_tol_upper=15) {
+  bind_rows(lapply(values, function(value) {
+    p <- base_bs
+    p[[param]] <- value
+    
+    Craw      <- price_bs_carr_madan(strikes, S0, r0, Tmat, p, N=2^18)
+    intrinsic <- pmax(S0 - strikes*exp(-r0*Tmat),0)
+    keep      <- which(Craw>intrinsic+1e-8)
+    if (!length(keep)) return(NULL)
+    
+    Kk   <- strikes[keep]
+    Ck   <- pmax(pmin(Craw[keep], S0-1e-8), intrinsic[keep]+1e-8)
+    iv   <- sapply(seq_along(Kk), function(i){
+      f <- function(v) bs_call_price(S0,Kk[i],r0,Tmat,v)-Ck[i]
+      tryCatch(
+        uniroot(f,lower=iv_tol_lower,upper=iv_tol_upper)$root,
+        error=function(e) NA_real_
+      )
+    })
+    data.frame(param=param, value=value,
+               strike=Kk,
+               logM=log(S0/Kk),
+               iv=iv)
+  })) %>% filter(!is.na(iv)) %>%
+    ggplot(aes(logM,iv,color=factor(value)))+
+    geom_line(size=1)+
+    labs(#title=sprintf("BS smile: %s varied",param),
+         x="Log-moneyness, ln(S₀/K)",y="Implied volatility",color=sprintf("%s",param))+
+    theme_minimal(base_size=14)
+}
+
+p_bs  <- make_bs_smiles("sigma", c(0.2, 0.3, 0.4, 0.5, 0.6))
+print(p_bs)
+# heston
+base_heston <- list(kappa = 1, theta = 0.2, sigma_v = 0.3,  rho = -0.5,  v0 = 0.2)
+make_heston_smiles <- function(param, values,          
+                               S0 = 500, strikes = seq(475, 525, by = 1),
+                               Tmat = 1, r0 = 0,
+                               iv_tol_lower = 1e-6, iv_tol_upper = 15
+) {
+  bind_rows(lapply(values, function(value) {
+    p <- base_heston
+    p[[param]] <- value
+    
+    # 1) raw Carr–Madan prices
+    Cmod_raw  <- price_heston_carr_madan(strikes, S0, r0, Tmat, p, N=2^18)
+    intrinsic <- pmax(S0 - strikes * exp(-r0 * Tmat), 0)
+    
+    # 2) only keep strikes where the raw price exceeds intrinsic + tiny eps
+    keep <- which(Cmod_raw > intrinsic + 1e-8)
+    if (length(keep)==0) return(NULL)
+    
+    Kk        <- strikes[keep]
+    Ck        <- Cmod_raw[keep]
+    intrinsic <- intrinsic[keep]
+    
+    # 3) clamp into no‑arb band
+    eps <- 1e-8
+    Cclamped <- pmin(pmax(Ck, intrinsic + eps), S0 - eps)
+    
+    # 4) invert to IV with tryCatch
+    iv_mod <- vapply(seq_along(Kk), function(i) {
+      f <- function(v) bs_call_price(S0, Kk[i], r0, Tmat, v) - Cclamped[i]
+      tryCatch(
+        uniroot(f, lower=iv_tol_lower, upper=iv_tol_upper, tol=1e-8)$root,
+        error = function(e) NA_real_
+      )
+    }, numeric(1))
+    
+    # 5) return
+    data.frame(
+      param   = param,
+      value   = value,
+      strike  = Kk,
+      logM    = log(S0 / Kk),
+      iv      = iv_mod
+    )
+  })) %>%
+    filter(!is.na(iv)) %>%
+    ggplot(aes(logM, iv, color=factor(value))) +
+    geom_line(size=1) +
+    labs(
+      #title = sprintf("Heston smile: %s varied", param),
+      x     = "Log-moneyness, ln(S₀/K)",
+      y     = "Implied volatility",
+      color = sprintf("%s", param)
+    ) +
+    theme_minimal(base_size=14)
+}
+
+
+p_h  <- make_heston_smiles("kappa", c(0.8, 0.9, 1, 1.1, 1.2))
+print(p_h)
+
+p_h  <- make_heston_smiles("theta", c(0.1, 0.2, 0.3, 0.4, 0.5))
+print(p_h)
+
+p_h  <- make_heston_smiles("sigma_v", c(0.2, 0.3, 0.4, 0.5, 0.6))
+print(p_h)
+
+p_h  <- make_heston_smiles("rho", c(-0.75, -0.5, 0, 0.5, 0.75))
+print(p_h)
+
+p_h  <- make_heston_smiles("v0", c(0.2, 0.3, 0.4, 0.5, 0.6))
+print(p_h)
+
+
+# 2) Merton
+base_merton <- list(sigma=0.2, lambda=4, alpha=0.0, delta=0.2)
+make_merton_smiles <- function(param, values, S0=500,
+                               strikes=seq(475, 525, by = 1),
+                               Tmat=1/252, r0=0,
+                               iv_tol_lower = 1e-6, iv_tol_upper = 15) {
+  bind_rows(lapply(values, function(value) {
+    p <- base_merton
+    p[[param]] <- value
+    
+    Craw      <- price_merton_carr_madan(strikes,S0,r0,Tmat,p,N=2^18)
+    intrinsic <- pmax(S0 - strikes*exp(-r0*Tmat),0)
+    keep      <- which(Craw>intrinsic+1e-8)
+    if(!length(keep)) return(NULL)
+    
+    Kk <- strikes[keep]
+    Ck <- pmax(pmin(Craw[keep], S0-1e-8), intrinsic[keep]+1e-8)
+    iv <- sapply(seq_along(Kk), function(i){
+      f <- function(v) bs_call_price(S0,Kk[i],r0,Tmat,v)-Ck[i]
+      tryCatch(uniroot(f, lower=iv_tol_lower,upper=iv_tol_upper)$root, error=function(e) NA_real_)
+    })
+    
+    data.frame(param=param,value=value,
+               strike=Kk,logM=log(S0/Kk),iv=iv)
+  })) %>% filter(!is.na(iv)) %>%
+    ggplot(aes(logM,iv,color=factor(value)))+
+    geom_line(size=1)+
+    labs(#title=sprintf("Merton smile: %s varied",param),
+         x="log‐moneyness, ln(S₀/K)",y="Implied volatility",color=sprintf("%s",param))+
+    theme_minimal(base_size=14)
+}
+
+
+p_m   <- make_merton_smiles("sigma", c(0.2, 0.3, 0.4, 0.5, 0.6))
+print(p_m)
+
+p_m   <- make_merton_smiles("lambda", c(0.1, 1, 4, 12))
+print(p_m)
+
+p_m   <- make_merton_smiles("alpha", c(-0.5, 0, 0.5, 1))
+print(p_m)
+
+p_m   <- make_merton_smiles("delta", c(0.2, 0.3, 0.4, 0.5, 0.6))
+print(p_m)
+
+# 3) Kou
+base_kou <- list(sigma=0.2, lambda=4, p=0.5, eta1=10, eta2=10)
+make_kou_smiles <- function(param,values,S0=500,
+                            strikes=seq(475, 525, by = 1),
+                            Tmat=1/252,r0=0,
+                            iv_tol_lower = 1e-6, iv_tol_upper = 15) {
+  bind_rows(lapply(values, function(value) {
+    p <- base_kou
+    p[[param]] <- value
+    
+    Craw      <- price_kou_carr_madan(strikes,S0,r0,Tmat,p,N=2^18)
+    intrinsic <- pmax(S0 - strikes*exp(-r0*Tmat),0)
+    keep      <- which(Craw>intrinsic+1e-8)
+    if(!length(keep)) return(NULL)
+    
+    Kk <- strikes[keep]
+    Ck <- pmax(pmin(Craw[keep], S0-1e-8), intrinsic[keep]+1e-8)
+    iv <- sapply(seq_along(Kk), function(i){
+      f <- function(v) bs_call_price(S0,Kk[i],r0,Tmat,v)-Ck[i]
+      tryCatch(uniroot(f, lower=iv_tol_lower,upper=iv_tol_upper)$root, error=function(e) NA_real_)
+    })
+    data.frame(param=param,value=value,
+               strike=Kk,logM=log(S0/Kk),iv=iv)
+  })) %>% filter(!is.na(iv)) %>%
+    ggplot(aes(logM,iv,color=factor(value)))+
+    geom_line(size=1)+
+    labs(#title=sprintf("Kou smile: %s varied",param),
+         x="log‐moneyness, ln(S₀/K)",y="Implied volatility",color=sprintf("%s",param))+
+    theme_minimal(base_size=14)
+}
+
+
+p_k   <- make_kou_smiles("sigma", c(0.2, 0.3, 0.4, 0.5, 0.6))
+print(p_k)
+
+p_k   <- make_kou_smiles("lambda", c(0.1, 1, 4, 12))
+print(p_k)
+
+p_k   <- make_kou_smiles("p", c(0.1, 0.5, 0.9))
+print(p_k)
+
+p_k   <- make_kou_smiles("eta1", c(5,10,20))
+print(p_k)
+
+p_k   <- make_kou_smiles("eta2", c(5,10,20))
+print(p_k)
+
+# 4) Bates
+base_bates <- c(base_heston, lambda=4, alpha=0, delta=0.2)
+make_bates_smiles <- function(param,values,S0=500,
+                              strikes=seq(475, 525, by = 1),
+                              Tmat=1/252,r0=0,
+                              iv_tol_lower = 1e-6, iv_tol_upper = 15) {
+  bind_rows(lapply(values, function(value) {
+    p <- base_bates
+    p[[param]] <- value
+    
+    Craw      <- price_bates_carr_madan(strikes,S0,r0,Tmat,p,N=2^18)
+    intrinsic <- pmax(S0 - strikes*exp(-r0*Tmat),0)
+    keep      <- which(Craw>intrinsic+1e-8)
+    if(!length(keep)) return(NULL)
+    
+    Kk <- strikes[keep]
+    Ck <- pmax(pmin(Craw[keep], S0-1e-8), intrinsic[keep]+1e-8)
+    iv <- sapply(seq_along(Kk), function(i){
+      f <- function(v) bs_call_price(S0,Kk[i],r0,Tmat,v)-Ck[i]
+      tryCatch(uniroot(f, lower=iv_tol_lower,upper=iv_tol_upper)$root, error=function(e) NA_real_)
+    })
+    data.frame(param=param,value=value,
+               strike=Kk,logM=log(S0/Kk),iv=iv)
+  })) %>% filter(!is.na(iv)) %>%
+    ggplot(aes(logM,iv,color=factor(value)))+
+    geom_line(size=1)+
+    labs(#title=sprintf("Bates smile: %s varied",param),
+      x="log‐moneyness, ln(S₀/K)",y="Implied volatility",color=sprintf("%s",param))+
+    theme_minimal(base_size=14)
+}
+
+p_b   <- make_bates_smiles("kappa", c(0.8, 0.9, 1, 1.1, 1.2))
+print(p_b)
+
+p_b   <- make_bates_smiles("theta", c(0.1, 0.2, 0.3, 0.4, 0.5))
+print(p_b)
+
+p_b   <- make_bates_smiles("sigma_v", c(0.2, 0.3, 0.4, 0.5, 0.6))
+print(p_b)
+
+p_b   <- make_bates_smiles("rho", c(-0.75, -0.5, 0, 0.5, 0.75))
+print(p_b)
+
+p_b   <- make_bates_smiles("v0", c(0.2, 0.3, 0.4, 0.5, 0.6))
+print(p_b)
+
+p_b   <- make_bates_smiles("lambda", c(0.1, 1, 4, 12))
+print(p_b)
+
+p_b   <- make_bates_smiles("alpha", c(-0.5, 0, 0.5, 1))
+print(p_b)
+
+p_b   <- make_bates_smiles("delta", c(0.2, 0.3, 0.4, 0.5, 0.6))
+print(p_b)
+
+
+
+# 5) Variance–Gamma
+base_vg <- list(sigma=0.2,theta=0,nu=0.5)
+make_vg_smiles <- function(param,values,S0=500,
+                           strikes=seq(475, 525, by = 1),
+                           Tmat=1/252,r0=0,
+                           iv_tol_lower = 1e-6, iv_tol_upper = 15) {
+  bind_rows(lapply(values, function(value) {
+    p <- base_vg
+    p[[param]] <- value
+    
+    Craw      <- price_VG_carr_madan(strikes,S0,r0,Tmat,p,N=2^18)
+    intrinsic <- pmax(S0 - strikes*exp(-r0*Tmat),0)
+    keep      <- which(Craw>intrinsic+1e-8)
+    if(!length(keep)) return(NULL)
+    
+    Kk <- strikes[keep]
+    Ck <- pmax(pmin(Craw[keep], S0-1e-8), intrinsic[keep]+1e-8)
+    iv <- sapply(seq_along(Kk), function(i){
+      f <- function(v) bs_call_price(S0,Kk[i],r0,Tmat,v)-Ck[i]
+      tryCatch(uniroot(f, lower=iv_tol_lower,upper=iv_tol_upper)$root, error=function(e) NA_real_)
+    })
+    data.frame(param=param,value=value,
+               strike=Kk,logM=log(S0/Kk),iv=iv)
+  })) %>% filter(!is.na(iv)) %>%
+    ggplot(aes(logM,iv,color=factor(value)))+
+    geom_line(size=1)+
+    labs(#title=sprintf("VG smile: %s varied",param),
+      x="log‐moneyness, ln(S₀/K)",y="Implied volatility",color=sprintf("%s",param))+
+    theme_minimal(base_size=14)
+}
+
+p_vg  <- make_vg_smiles("sigma", c(0.2, 0.3, 0.4, 0.5, 0.6))
+print(p_vg)
+
+p_vg  <- make_vg_smiles("theta", c(0,0.1,0.2,0.3,0.4))
+print(p_vg)
+
+p_vg  <- make_vg_smiles("nu", c(0.2,0.5,1))
+print(p_vg)
+
+# — examples —
+
+p_bs  <- make_bs_smiles("sigma", c(0.8, 0.9, 1, 1.1, 1.2))
+print(p_bs)
+
+p_h  <- make_heston_smiles("sigma_v", c(0.8, 0.9, 1, 1.1, 1.2))
+
+
+
+p_m   <- make_merton_smiles("lambda", c(0.5,1,2))
+p_k   <- make_kou_smiles("eta1", c(5,10,20))
+p_b   <- make_bates_smiles("delta", c(0.1,0.2,0.4))
+p_vg  <- make_vg_smiles("nu", c(0.1,0.5,1))
+
+print(p_bs); print(p_h); print(p_m); print(p_k); print(p_b); print(p_vg)
+
+
+
+
+
+# 1) find the best (smallest) mse_iv for Kou, fft pricer, fit_to="iv"
+best_fit <- all_df_temp %>% 
+  filter(conv == 0,
+         model   == "Kou",
+         pricer  == "fft",
+         fit_to  == "iv") %>% 
+  slice_min(mse_iv, n = 1)
+
+best_time   <- best_fit$datetime
+best_params <- best_fit %>% select(sigma, lambda, p, eta1, eta2) %>% as.list()
+
+# 2) grab the market data at that datetime
+#    assume your `option_book` is keyed by day, then by strike
+#    and that the `day` column in all_df_temp matches names(option_book)
+best_day <- format(best_time, "%Y-%m-%d")  # or however you index `option_book`
+
+market_df <- bind_rows(
+  lapply(names(option_book[[best_day]]), function(Ks) {
+    df <- option_book[[best_day]][[Ks]] %>% 
+      filter(time == best_time)
+    if (nrow(df)==0) return(NULL)
+    data.frame(
+      strike  = as.numeric(Ks),
+      iv_mkt  = df$IV,
+      ttm = df$ttm
+    )
+  })
+) %>% arrange(strike) %>% filter(iv_mkt > 0.03)
+
+# 3) compute model call prices & invert to IV
+S0   <- SPYdata %>% filter(time==best_time) %>% pull(o) %>% first()
+r0   <- 0
+Ttm  <- market_df %>% pull(ttm) %>% first() / 252  # or store Ttm somewhere
+
+# price the calls under Kou with your calibrated parameters:
+C_model <- price_kou_carr_madan(
+  strikes = market_df$strike,
+  S0      = S0,
+  r       = r0,
+  T       = Ttm,
+  params  = best_params,
+  N       = 2^15    # match your calibration grid
+)
+
+# invert to implied vol
+iv_model <- mapply(
+  FUN = implied_vol,
+  price = C_model,
+  K     = market_df$strike,
+  MoreArgs = list(S0 = S0, r = r0, T = Ttm,
+                  lower = 1e-6, upper = 15, tol = 1e-8)
+)
+
+# 4) assemble and plot
+smile_df <- market_df %>%
+  mutate(iv_model = iv_model) %>%
+  pivot_longer(c(iv_mkt, iv_model),
+               names_to  = "series",
+               values_to = "iv") %>%
+  mutate(series = recode(series,
+                         iv_mkt   = "Market IV",
+                         iv_model = "Kou model IV"))
+
+ggplot(smile_df, aes(log(S0 / strike), iv, color = series)) +
+  geom_line(size = 0.5) +
+  geom_point(size = 3) +
+  labs(
+    x     = "Log-moneyness, ln(S₀ / K)",
+    y     = "Implied volatility",
+    color = ""
+  ) +
+  theme_minimal(base_size = 14)+
+  theme(
+    legend.position   = c(0.5, 0.85),      # put it inside the panel
+    legend.background = element_blank(),     # no background box
+    legend.key        = element_blank(),      # and no little key boxes either
+    legend.key.size   = unit(1.5, "lines"),
+    legend.text       = element_text(size = 14),  # match your axis‐title size
+    legend.title      = element_text(size = 14)   # if you ever have a title
+  )+
+  guides(
+    color = guide_legend(
+      override.aes = list(
+        size     = 2,
+        stroke   = 1.5,
+        linewidth = 1  # line thickness in legend
+      )
+    )
+  )
+
